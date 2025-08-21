@@ -1,0 +1,18 @@
+# Build outputs
+build/
+dist/
+*.exe
+
+# Test outputs  
+coverage.out
+coverage.html
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
