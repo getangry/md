@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., v1.0.0)'
+        required: true
+        type: string
+
+env:
+  GO_VERSION: "1.25.0"
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Set version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Run tests
+        run: go test -v -race ./...
+
+      - name: Build binaries
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          COMMIT=${GITHUB_SHA::8}
+          
+          mkdir -p dist
+          
+          # Build matrix
+          PLATFORMS=(
+            "linux/amd64"
+            "linux/arm64"
+            "darwin/amd64"
+            "darwin/arm64"
+            "windows/amd64"
+          )
+          
+          for platform in "${PLATFORMS[@]}"; do
+            IFS='/' read -r GOOS GOARCH <<< "$platform"
+            
+            BINARY_NAME=md
+            if [ "$GOOS" = "windows" ]; then
+              BINARY_NAME=${BINARY_NAME}.exe
+            fi
+            
+            echo "Building for $GOOS/$GOARCH..."
+            
+            GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=0 go build \
+              -ldflags="-w -s -X main.version=${VERSION} -X main.commit=${COMMIT}" \
+              -o dist/${BINARY_NAME} .
+            
+            # Create archive
+            if [ "$GOOS" = "windows" ]; then
+              zip -j dist/md-${VERSION}-${GOOS}-${GOARCH}.zip dist/${BINARY_NAME}
+            else
+              tar -czf dist/md-${VERSION}-${GOOS}-${GOARCH}.tar.gz -C dist ${BINARY_NAME}
+            fi
+            
+            # Remove binary after archiving
+            rm dist/${BINARY_NAME}
+          done
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          
+          # Get the previous tag
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -v "^${VERSION}$" | head -n 1)
+          
+          if [ -n "$PREVIOUS_TAG" ]; then
+            echo "Generating changelog from $PREVIOUS_TAG to $VERSION"
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" ${PREVIOUS_TAG}..HEAD)
+          else
+            echo "No previous tag found, using all commits"
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)")
+          fi
+          
+          # Write changelog to file for release notes
+          cat > release_notes.md << EOF
+          ## What's Changed
+          
+          $CHANGELOG
+          
+          ## Download
+          
+          Choose the appropriate binary for your platform:
+          
+          - **Linux (x64)**: \`md-${VERSION}-linux-amd64.tar.gz\`
+          - **Linux (ARM64)**: \`md-${VERSION}-linux-arm64.tar.gz\`
+          - **macOS (Intel)**: \`md-${VERSION}-darwin-amd64.tar.gz\`
+          - **macOS (Apple Silicon)**: \`md-${VERSION}-darwin-arm64.tar.gz\`
+          - **Windows (x64)**: \`md-${VERSION}-windows-amd64.zip\`
+          
+          Extract the archive and run the binary directly.
+          
+          ## Checksums
+          
+          Verify your download with the checksums in \`checksums.txt\`.
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          body_path: release_notes.md
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
